@@ -1,6 +1,8 @@
 "use strict";
 
 const API = "https://dummyjson.com";
+const JSONBIN_BIN_ID = "6a5e1a9ef5f4af5e29a79df9";
+const JSONBIN_ACCESS_KEY = "$2a$10$PuVyxaFxT4yk97ZT7R6i3eFg19acqaK2AP4hCAj7FYozwUzxuQ19q";
 const app = document.querySelector("#app");
 const state = {
   products: [], categories: [], catalogProducts: [], catalogTitle: "The Collection",
@@ -9,6 +11,7 @@ const state = {
   user: read("aurelle-current-user", null), stockLevels: read("aurelle-stock-levels", {}), notice: ""
 };
 let noticeTimer, syncTimer;
+const demoUser = { name: "Demo Client", email: "demo@aurelle.com", password: "Aurelle123", address: "12 Avenue Montaigne, Paris", orders: [], cart: [] };
 
 const icons = {
   search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>',
@@ -120,9 +123,93 @@ function addToCart(id) {
   const existing = state.cart.find(item => item.id === id); if (productStock(id) <= (existing?.quantity || 0)) return showNotice("This creation is currently out of stock");
   existing ? existing.quantity++ : state.cart.push({ id: p.id, title: p.title, thumbnail: p.thumbnail, price: p.price, quantity: 1 }); saveSession(); showNotice(`${p.title} was added to your bag`);
 }
-function users() { const saved = read("maison-brells-users", []); return saved.some(u => u.email === "demo@aurelle.com") ? saved : [...saved, { name: "Demo Client", email: "demo@aurelle.com", password: "Aurelle123", address: "12 Avenue Montaigne, Paris", orders: [], cart: [] }]; }
+function users() { const saved = read("maison-brells-users", []); return saved.some(u => u.email === "demo@aurelle.com") ? saved : [...saved, demoUser]; }
 function saveUsers(list) { localStorage.setItem("maison-brells-users", JSON.stringify(list)); }
+function jsonbinConfigured() { return JSONBIN_BIN_ID.trim() && JSONBIN_ACCESS_KEY.trim(); }
+async function readRemoteStore() {
+  const response = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID.trim()}/latest`, { headers: { "X-Access-Key": JSONBIN_ACCESS_KEY.trim() } });
+  if (!response.ok) throw new Error(`JSONBin read failed (${response.status})`);
+  const payload = await response.json();
+  const record = payload.record && typeof payload.record === "object" ? payload.record : {};
+  const list = Array.isArray(record.users) ? record.users : [];
+  return {
+    ...record,
+    users: list.some(u => String(u.email).toLowerCase() === demoUser.email) ? list : [...list, demoUser],
+    stockLevels: record.stockLevels && typeof record.stockLevels === "object" ? record.stockLevels : {}
+  };
+}
+async function writeRemoteStore(store) {
+  const response = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID.trim()}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-Access-Key": JSONBIN_ACCESS_KEY.trim() },
+    body: JSON.stringify(store)
+  });
+  if (!response.ok) throw new Error(`JSONBin update failed (${response.status})`);
+}
+async function directStoreRequest(body) {
+  const store = await readRemoteStore();
+  const list = store.users;
+  const email = String(body.email || "").trim().toLowerCase();
+  const index = list.findIndex(u => String(u.email).toLowerCase() === email);
+
+  if (body.action === "load-inventory") {
+    let changed = false;
+    for (const [id, value] of Object.entries(body.defaults || {})) {
+      if (store.stockLevels[id] === undefined) {
+        store.stockLevels[id] = Math.max(0, Number(value) || 0);
+        changed = true;
+      }
+    }
+    if (changed) await writeRemoteStore(store);
+    return { ok: true, stockLevels: store.stockLevels };
+  }
+  if (body.action === "login") {
+    const user = list[index];
+    if (user && user.password === body.password) return { ok: true, user };
+    throw new Error("Incorrect email or password");
+  }
+  if (body.action === "register") {
+    if (index >= 0) throw new Error("This email is already registered");
+    const user = { ...body.user, email, orders: [], cart: body.user.cart || [] };
+    store.users = [...list, user];
+    await writeRemoteStore(store);
+    return { ok: true, user };
+  }
+  if (body.action === "purchase") {
+    const items = Array.isArray(body.order?.items) ? body.order.items : [];
+    if (!items.length) throw new Error("Your shopping bag is empty");
+    for (const item of items) {
+      const quantity = Number(item.quantity);
+      const available = Number(store.stockLevels[item.id] || 0);
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > available) {
+        const error = new Error(`${item.title || "A product"} only has ${available} piece${available === 1 ? "" : "s"} available`);
+        error.stockLevels = store.stockLevels;
+        throw error;
+      }
+    }
+    const user = list[index];
+    if (email && (!user || user.password !== body.password)) throw new Error("Session verification failed");
+    for (const item of items) store.stockLevels[item.id] -= Number(item.quantity);
+    if (user) {
+      list[index] = { ...user, address: body.address, orders: [body.order, ...(user.orders || [])], cart: [] };
+      store.users = list;
+    }
+    await writeRemoteStore(store);
+    return { ok: true, user: user ? list[index] : null, stockLevels: store.stockLevels };
+  }
+
+  const user = list[index];
+  if (!user || user.password !== body.password) throw new Error("Session verification failed");
+  if (body.action === "sync-cart") {
+    list[index] = { ...user, cart: body.cart || [] };
+    store.users = list;
+    await writeRemoteStore(store);
+    return { ok: true };
+  }
+  throw new Error("Unknown action");
+}
 async function storeRequest(body) {
+  if (jsonbinConfigured()) return directStoreRequest(body);
   const response = await fetch("/api/store", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const result = await response.json();
   if (!response.ok) { const error = new Error(result.message || "The request could not be completed"); error.stockLevels = result.stockLevels; throw error; }
